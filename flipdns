@@ -1,0 +1,477 @@
+#!/bin/bash
+
+# Exit codes
+# 1 - Bad argument
+# 2 - File system problem
+# 3 - iface problem
+# 4 - on public dns, private not avail
+
+# log: prog >> date >> user >> args >> prior dns >> post dns
+
+# to define a set of servers to use together, separate with a pipe (i.e. 1.1.1.1|1.0.0.1)
+# to define a set of servers to use separately, separate with a colon (i.e. 1.1.1.1:1.0.0.1)
+private_dns="1.1.1.1|1.0.0.1"
+public_dns="1.1.1.1|1.0.0.1:8.8.8.8|8.8.4.4"
+
+# 0 - --disable/--reset will revert dns to automatic using the dhcp server
+# 1 - --disable/--reset will revert dns to a saved value of the original record
+save_prior=1
+save_prior_loc='/usr/local/share/flipdns' # no trailing slash
+
+# TODO adapt script to use local conf, vars in script should only be defaults
+
+# script-driven flags and globals (not user configurable)
+verbosity=0 forced=0 any_private_active=0 any_public_active=0 available_prv=0
+iface="" conname=""
+prior_dns=() prior_type=() prior_status=() params=()
+all_prv=() # this does not pay any attention to server grouping
+all_prv_status=() # this also does not pay attention to server grouping
+
+msg() {
+	# Just a more convenient shorthand way to print to the user in some situtions below
+	# msg [lvl] [string] [err if lvl 2]
+	# lvl -- 0(verbosity required) 1(always out) 2(quit with err)
+	( [[ $1 -ge 1 ]] || [[ $verbosity -eq 1 ]] ) && \
+		echo "flipdns: $2"
+	[[ $1 -eq 2 ]] && exit $3
+}
+
+	#	opt=$(echo $addr_set | sed 's/|/, /g')
+log_create() {
+	# only executable if sudo
+	if [ "$EUID" -ne 0 ]; then
+		echo "You can only use this option as root."
+		echo "Please try again with sudo."
+		exit 1
+	fi
+
+	# Creates log file
+	mkdir -p /var/log/flipdns
+	touch /var/log/flipdns/flip.log
+
+	# Allows user-ran script to add to log file
+	chmod 666 /var/log/flipdns/flip.log
+
+	[[ $save_prior -ge 1 ]] && {
+		# save prior dns addr if saving is enabled
+		mkdir -p "$save_prior_loc"
+		touch "$save_prior_loc/prior"
+		chmod 666 "$save_prior_loc/prior"
+	
+		# Saving original dns addr
+		get_cur_dns
+		echo "${prior_dns[*]}" > "$save_prior_loc/prior"
+	}
+
+	echo "Setup complete. You can run normally."
+}
+
+log_msg() {
+	! [[ -d /var/log/flipdns ]] && return 1			# bails if no log dir found
+	! [[ -f /var/log/flipdns/flip.log ]] && return 1	# bails if no log file found
+	echo "flipdns >> $(date +%F\ %T) >> $USER >> $params >> $@" >> /var/log/flipdns/flip.log
+}
+
+establish() {
+	select_iface
+	get_cur_dns
+	get_cur_type
+	display_current
+	display_prior_status
+	get_prv_status
+}
+
+forceflip() {
+	# Bypasses all other checks found in flipcli_auto
+	forced=1
+	establish
+
+	# Changes prompt and options based on current setting
+	[[ $any_public_active -gt 0 ]] \
+		&& offer_private \
+		|| offer_public
+}
+
+disable_flip() {
+	validation='^(((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9]))\ ?){1,2}$'
+	# ^regex used to validate saved ip addresses
+	tput sc
+	printf '... Disabling FlipDNS'
+	select_iface
+
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Checking if original DNS settings were stored"
+	[[ $save_prior -ge 1 ]] && \
+	[[ -f "$save_prior_loc/prior" ]] && \
+	[[ $(<"$save_prior_loc/prior") =~ $validation ]] && {
+		# Manually resets to original if savefile exists and is valid
+		[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Setting DNS source to original setting"
+		priordns="$(cat $save_prior_loc/prior)"
+		nmcli c m "$conname" ipv4.dns "$priordns"
+		tput rc
+		tput ed
+		printf "FlipDNS disabled. Using original DNS servers ($priordns).\n"
+	} || {
+		# Without changing NetworkManager to automatic, it won't get a new server address and
+		# user will have no connectivity
+		[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Setting DNS source to DHCP (automatic)"
+		nmcli c m "$conname" ipv4.dns ""
+		nmcli c m "$conname" ipv4.ignore-auto-dns no
+		tput rc
+		tput ed
+		printf 'FlipDNS disabled. Using DHCP provided DNS servers (automatic).\n'
+	}
+
+	# Bouncing connection to force reciept of new dns servers from dhcp
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Restarting network interface of \"$conname\""
+	nmcli c down "$conname"	1>/dev/null
+	nmcli c up "$conname" 1>/dev/null
+
+	printf 'The next time you run FlipDNS will re-enable it.\n'
+}
+
+flipcli_auto() {
+	establish
+
+	# Path is decided now if public or private will be offered and if a switch is even allowed
+	# If on private without problem, no choice will be offered
+	# If on public and private is still down, no choice will be offered
+	[[ $any_public_active -gt 0 ]] && {
+		[[ $available_prv -gt 0 ]] \
+			&& offer_private \
+			|| { printf "\nUsing public DNS servers. Private servers not responding.\n" \
+			&& exit 4; }
+	} || {
+		[[ "${prior_status[*]}" =~ "Responding" ]] \
+			&& printf "\nUsing private DNS servers and they are responsive.\n" \
+			&& exit 0 \
+			|| offer_public;
+	}
+}
+
+set_dns() {
+	# NetworkManager will write over FlipDNS's change if left to automatic
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Setting NetworkManager to ignore DHCP for DNS"
+	nmcli c m "$conname" ipv4.ignore-auto-dns yes
+
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Setting DNS server"
+	nmcli c m "$conname" ipv4.dns "$1"
+
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Restarting network interface of \"$conname\""
+
+	# bounce connection to force use of new dns servers (otherwise, it will take time)
+	nmcli c down "$conname"	1>/dev/null
+	nmcli c up "$conname" 1>/dev/null
+	log_msg "${prior_dns[@]} >> $1"
+}
+
+set_custom() {
+	validation='^(((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9]))\ ?){1,2}$'
+	# ^regex used to validate user-entered IP addresses 
+
+	printf 'Enter the IP address of your DNS provider.\n'
+	printf 'If entering two address, separate with a space (1.1.1.1 1.0.0.1).\n'
+	read -p "DNS Servers: " dns_in
+
+	# validate user input
+	! [[ $dns_in =~ $validation ]] && msg 2 "invalid ip address entry"
+	
+	set_dns "$dns_in"
+}
+
+test_invalid_dns() {
+	select_iface
+
+	invalid_addr="1.2.3.4"	# This can be changed to any known-invalid address
+	tput sc
+
+	# Test current DNS responsiveness
+	printf 'Current DNS status: testing...'
+	[ "$(dig +short example.com.)" ] \
+		&& prior="Not responding" \
+		|| prior="Responding"
+	tput rc
+	tput ed
+	printf '%s %s\n' 'Current DNS status:' "$prior"
+
+	# Change DNS server to the known-bad address from above
+	printf '%s %s %s\n' 'Changing DNS server to' $invalid_addr '(known bad)'
+	set_dns "1.2.3.4"	
+	tput sc
+
+	# Test new (known bad) DNS responsiveness
+	printf 'New DNS status: testing...'
+	[ "$(dig +short example.com.)" ] \
+		&& current="Not responding" \
+		|| current="Responding"
+	tput rc
+	tput ed
+	printf '%s %s\n\n' 'New DNS status:' "$current"
+
+	# Return DNS server to original setting post-test (when user is ready)
+	printf '%s\n' "If you'd like to run outside tests, do so now."
+	read -p "Press Enter when ready to reset DNS. "
+	set_dns "${prior_dns[@]}"
+	printf '%s\n' 'DNS has been returned to normal.'
+}
+
+check_log_exists() {
+	! [[ -d /var/log/flipdns/ ]] \
+		&& echo "Please run \"sudo flipdns init\" the first time to set up." \
+		&& exit 1
+	! [[ -f /var/log/flipdns/flip.log ]] \
+		&& echo "Please run \"sudo flipdns init\" the first time to set up." \
+		&& exit 1
+}
+
+offer_private() {
+	# Prepare private dns options list
+	opt_list=("Do nothing" "Enter custom")
+	all_prv_status_worker=("${all_prv_status[@]}")
+	while read addr_set; do
+		opt=$(echo $addr_set | sed 's/|/, /g')
+		set_size=$(echo $opt | awk -F ', ' '{print NF}')
+		# Fetching status of each private dns server to display in menu
+		opt_status=$(echo ${all_prv_status_worker[@]:0:set_size})
+		opt_status="${opt_status// R/, R}"
+		opt_status="${opt_status// N/, N}"
+		# Forming actual menu options
+		opt_list+=("$(printf '%s (%s)' "$opt" "$opt_status")")
+		all_prv_status_worker=$(echo ${all_prv_status_worker[@]:set_size})
+	done <<-EOT
+		$(echo $private_dns | sed 's/:/\n/g')
+	EOT
+
+	# Change prompt if ran with --force
+	printf '\nCurrently using public DNS servers.'
+	[[ $forced -eq 1 ]] \
+		&& printf ' Force a switch to private?\n\n' \
+		|| printf ' Would you like to switch to private?\n\n'
+
+	# Prompt user to select which private dns server to use (or their own)
+	select opt in "${opt_list[@]}"; do
+		case $REPLY in
+			1)
+				echo "Quitting."
+				exit 0;;
+			2)
+				echo;
+				set_custom
+				break
+				;;
+			*)
+				! [[ ${#opt_list[@]} -ge $REPLY ]] \
+				&& echo -e "Invalid selection\n" \
+				&& continue
+				reduced_opt=$(echo $opt | awk -F ' \(' '{print $1}' | sed 's/, / /g')
+				set_dns "$reduced_opt"
+				break
+				;;
+		esac
+	done
+	printf 'DNS provider has been switched.\n'
+}
+
+offer_public() {
+	# Prepare public dns options list
+	opt_list=("Do nothing" "Enter custom")
+	while read addr_set; do
+		opt=$(echo $addr_set | sed 's/|/, /g')
+		opt_list+=("$(printf '%s' "$opt")")
+	done <<-EOT
+		$(echo $public_dns | sed 's/:/\n/g')
+	EOT
+
+	# Change prompt when ran with --force
+	printf '\nCurrently using private DNS servers.'
+	[[ $forced -eq 1 ]] \
+		&& printf ' Force a switch to public?\n\n' \
+		|| printf ' They may be offline. Would you like to switch to public?\n\n'
+
+	# Prompt user to select which public DNS provider they would like to use (or their own)
+	select opt in "${opt_list[@]}"; do
+		case $REPLY in
+			1)
+				echo "Quitting."
+				exit 0;;
+			2)
+				echo;
+				set_custom
+				break
+				;;
+			*)
+				! [[ ${#opt_list[@]} -ge $REPLY ]] \
+				&& echo -e "Invalid selection\n" \
+				&& continue
+				reduced_opt=$(echo $opt | awk -F ' \(' '{print $1}' | sed 's/, / /g')
+				set_dns "$reduced_opt"
+				break
+				;;
+		esac
+	done
+	printf 'DNS provider has been switched.\n'
+}
+
+display_prior_status() {
+	# Checking the responsiveness of each current dns server
+	# Used later to decide if a switch is needed and to display the pre-run condition (& log)
+	tput sc
+	printf "... checking current dns servers"
+	[[ $verbosity -ge 1 ]] && echo -e "\n>> FlipDNS >> Checking current DNS status"
+	while read addr; do
+		[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Checking current DNS status >> Testing $addr"
+		[ "$(dig @$addr +short -t srv _ldap._tcp.example.com.)" ] \
+			&& prior_status+=("Not responding") \
+			|| prior_status+=("Responding")
+	done <<-EOT
+		$(printf '%s\n' "${prior_dns[@]}")
+	EOT
+	tput rc
+	tput ed
+	printf '%-25s%-20s%-20s\n' 'Status:' "${prior_status[@]}"
+}
+
+get_prv_status() {
+	# Checking the responsiveness of each private dns server
+	# Used later to decide if able to switch public->private and will be displayed in options
+	tput sc
+	printf "... checking internal dns servers"
+	[[ $verbosity -ge 1 ]] && echo -e "\n>> FlipDNS >> Getting private DNS status"
+	while read addr; do
+		[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Getting private DNS status >> Testing $addr"
+		! [ "$(dig @$addr +short -t srv _ldap._tcp.example.com.)" ] \
+		&& all_prv_status+=("Responding") \
+			&& available_prv=1 \
+			|| all_prv_status+=("Not responding")
+			# available_prv is set to indicate **at least** one private server is being used
+			# all_prv_status is indexed the same as all_prv, can be iterated over together
+	done <<-EOT
+		$(printf '%s\n' "${all_prv[@]}")
+	EOT
+	tput rc
+	tput ed
+}
+
+get_cur_type() {
+	# TODO check that $prior_dns and $private_dns is set
+
+	# Form an array of all private dns servers
+	# Address pairs (i.e. 1.1.1.1|1.0.0.1) will be separated here
+	# This array will be used to track of the responsiveness of each server and to check if any
+	# private dns server is active on interface
+	while read addr; do
+		all_prv+=($addr)
+	done <<-EOT
+		$(echo $private_dns | sed 's/|/\n/g;s/:/\n/g')
+	EOT
+
+	# Checking to see how many (if any) public vs private dns servers are active on interface
+	# If any public is set, script will act as if using public (even if one private one public)
+	while read addr; do
+		[[ "${all_prv[*]}" =~ "$addr" ]] \
+			&& prior_type+=("Private") \
+			&& ((any_private_active+=1)) \
+			|| { prior_type+=("Public") \
+			&& ((any_public_active+=1)); }
+	done <<-EOT
+		$(printf '%s\n' "${prior_dns[@]}")
+	EOT
+}
+
+get_cur_dns() {
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Getting current DNS setting"
+	while read addr; do
+		prior_dns+=($addr)
+	done <<-EOT
+		$(nmcli -g IP4 d show $iface \
+		| awk -F: '{print $5}' \
+		| sed 's/ | /\n/g')
+	EOT
+}
+
+select_iface() {
+	# TODO add selector for multiple active interfaces
+	[[ $verbosity -ge 1 ]] && echo ">> FlipDNS >> Fetching active interface"
+	ifaces=$(nmcli -g type,name,device c show --active \
+		| awk -F: 'BEGIN {OFS=":"} /ethernet|wireless/ {print $2,$3}')
+	iface_qty=$(echo $ifaces | wc -l)
+	[[ $iface_qty -eq 0 ]] && msg 2 "no active interface detected" 3
+	[[ $iface_qty -eq 1 ]] && \
+		conname=$(echo $ifaces | awk -F: '{print $1}') && \
+		iface=$(echo $ifaces | awk -F: '{print $2}')
+	[[ $iface_qty -gt 1 ]] && msg 2 "too many active interfaces detected" 3
+}
+
+display_current() {
+	# TODO check if $prior_dns is set
+	printf '%-25s%-20s%-20s\n' 'Current DNS setting:' ${prior_dns[@]}
+	printf '%-25s%-20s%-20s\n' 'Server type:' ${prior_type[@]}
+}
+
+flush_cache() {
+	prior_size=$(resolvectl statistics | grep "Size" | awk -F ': ' '{print $2}')
+	resolvectl flush-caches
+	echo "Local DNS cache has been flushed ($prior_size total)"
+}
+
+showhelp() {
+	printf '%-10s%-40s\n' 'FlipDNS' 'Business DNS management simplified'
+	printf '%3s%-5s%-13s%-40s\n' '' '-h' '--help'    'Show this menu'
+	printf '%3s%-5s%-13s%-40s\n' '' '-v' '--verbose' 'Show more detailed messages'
+	printf '%3s%-5s%-13s%-40s\n' '' '-f' '--force'   'Ignore server status and force a switch'
+	printf '%3s%-5s%-13s%-40s\n' '' ''   '--reset'   'Disable FlipDNS and revert to original setting'
+	printf '%3s%-5s%-13s%-40s\n' '' ''   '--flush'   'Flush stored DNS queries and answers'
+	printf '%3s%-5s%-13s%-40s\n' '' ''   '--test'    'Switch to a known-bad server and test'
+}
+
+params=$@
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-h|--help)
+			showhelp
+			exit 0
+			;;
+		-v|--verbose)
+			check_log_exists # comment this out if you want to run without logging requirement
+			verbosity=1
+			shift
+			;;
+		-f|--force)
+			check_log_exists # comment this out if you want to run without logging requirement
+			forceflip	
+			exit 0
+			;;
+		--disable)	# alias of --reset
+			check_log_exists # comment this out if you want to run without logging requirement
+			disable_flip
+			exit 0
+			;;
+		--reset)
+			check_log_exists # comment this out if you want to run without logging requirement
+			disable_flip
+			exit 0
+			;;
+		--flush)
+			check_log_exists # comment this out if you want to run without logging requirement
+			flush_cache
+			exit 0
+			;;
+		--test)
+			check_log_exists # comment this out if you want to run without logging requirement
+			test_invalid_dns
+			exit 0
+			;;
+		init)
+			log_create
+			exit 0
+			;;
+		*)
+			echo "flipdns: invalid option $1"
+			showhelp
+			exit 1
+			;;
+	esac
+done
+check_log_exists
+[[ $# -eq 0 ]] \
+	&& flipcli_auto
